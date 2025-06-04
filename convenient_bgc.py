@@ -1,0 +1,146 @@
+from dask_gateway import Gateway, GatewayCluster
+from distributed import Client, LocalCluster
+from scipy.interpolate import interpn, NearestNDInterpolator
+from datetime import datetime
+import json, gcsfs, fsspec
+import numpy as np, numpy.ma as ma
+import xarray as xr
+import zarr
+import math
+
+def get_compressed_mask(maskfile) -> (np.ndarray, np.ndarray, ma.core.MaskedArray, np.ndarray, np.ndarray):
+    """Open mask file"""
+    m = xr.open_dataset(maskfile)
+    mask0 = m.float_mask[:]
+    long = m.lon[:]
+    latg = m.lat[:]
+    lonM, latM = np.meshgrid(long, latg)
+    lon_comp = ma.MaskedArray(lonM, 1-mask0).compressed()  # 1-mask0 since ma.MaskedArray masks wanted (unwanted) values as False (True).
+    lat_comp = ma.MaskedArray(latM, 1-mask0).compressed()  # 1-mask0 since ma.MaskedArray masks wanted (unwanted) values to False (True).
+    mask = ma.array(mask0, mask=mask0)
+    return lat_comp, lon_comp, mask, latg, long
+
+def get_betaparams_bgc(betaparamfile) -> (np.ndarray, np.ndarray, np.ndarray, zarr.hierarchy.Group):
+    """open betaparam file for BGC data"""
+    b = xr.open_dataset(betaparamfile)
+    return b.latitude[:], b.longitude[:], b.betaparam[:,:,:,0], b
+    
+def get_BGCdata(datafile, datafield, plevel) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, xr.core.dataset.Dataset):
+    """Open BGC datafile"""
+    d1 = xr.open_dataset(datafile).isel(pressure=plevel)
+    time = (
+        ( d1.time.values.astype('datetime64[ns]') - np.datetime64('1970-01-01T00:00:00', 'ns') 
+       ) / np.timedelta64(1,'ns') 
+    ) / 1e9 / 86400 # days ref. 1970-01-01
+    
+    temp1 = d1.temperature.values
+    salt1 = d1.salinity.values
+    bgc1 = d1[datafield].values #not sure if this is correct
+    return d1.lat.values, d1.lon.values, time, temp1, salt1, bgc1, d1 #remove the abs
+
+def get_meandata(datafile)-> (np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, xr.core.dataset.Dataset):
+    """open mean data file for TS"""
+    dm = xr.open_dataset(datafile)
+    time = (
+        ( dm.time.values.astype('datetime64[ns]') - np.datetime64('1970-01-01T00:00:00', 'ns') 
+       ) / np.timedelta64(1,'ns') 
+    ) / 1e9 / 86400 # days ref. 1970-01-01
+    
+    temp_mean = dm.mean_temp.values
+    temp_res = dm.residuals_temp.values
+    sal_mean = dm.mean_sal.values
+    sal_res = dm.residuals_sal.values
+    
+    return dm.latitude.values, dm.longitude.values, time, temp_mean, temp_res, sal_mean, sal_res, dm
+
+##Update this to make generic
+def get_meanbgcdata(datafile)-> (np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, xr.core.dataset.Dataset):
+    """Open point large scale mean and residual BGC data file"""
+    mb = xr.open_dataset(datafile)
+    time = (
+        ( mb.time.values.astype('datetime64[ns]') - np.datetime64('1970-01-01T00:00:00', 'ns') 
+       ) / np.timedelta64(1,'ns') 
+    ) / 1e9 / 86400 # days ref. 1970-01-01
+    
+    bgc_res = mb.residuals_bgc.values
+    bgc_mean = mb.residuals_bgc.values
+    
+    return mb.latitude.values, mb.longitude.values, time, bgc_res, bgc_mean, mb
+
+def get_interpolated_parameters( parameters, blat, blon, f_lat, f_lon ) -> np.ndarray:
+
+    """
+    The "left-end"-array is concatenated onto the "right-end" of the array.
+    """
+    
+    # Preallocation
+    interpolated = np.full( shape=(len(f_lat), parameters.shape[2]), fill_value=np.nan )
+
+    # Wraparound
+    param_leftcolumn = np.full( shape=(blat.size, parameters.shape[2]), fill_value=parameters[:,0,:] )
+    param_leftcolumn = param_leftcolumn.reshape(blat.size,1,parameters.shape[2])
+    param_wrapped = np.concatenate( (parameters, param_leftcolumn), axis=1)    
+    wlon = np.append(blon,blon[-1]+1)
+
+    # Interpolation
+    points = (blat, wlon)
+    xi = (f_lat, f_lon)
+    for i in range(parameters.shape[2]):
+        values = param_wrapped[:,:,i]
+        interpolated[:,i] = interpn(points, values, xi, bounds_error=False, fill_value=np.nan)
+        """
+        In interpn:
+        parameters = beta parameters
+        blat/blon = beta param locations
+        f_lat, f_lon = data locations
+        """
+    fail = np.isnan(interpolated[:,0])
+    if fail.sum() > 0:
+        mask = np.isnan(param_wrapped[:,:,0])
+        lon_grid, lat_grid  = np.meshgrid(wlon, blat)
+        lonM, latM = ma.MaskedArray(lon_grid, mask).compressed(),ma.MaskedArray(lat_grid, mask).compressed()
+        for i in range(parameters.shape[2]):
+            interp = NearestNDInterpolator(list(zip(lonM, latM)), param_wrapped[:,:,i][~mask])
+            interpolated[fail,i] = interp(f_lon[fail], f_lat[fail])
+            
+    print('  Interpolated to', f_lat.size,'coordinates. Nan-estimate: '+str(np.isnan(interpolated).sum()/parameters.shape[2])+'.', end='' )
+    return interpolated
+
+def get_meangrid_TS(datafile)-> (np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, xr.core.dataset.Dataset):
+    
+    """get gridded mean data file for TS to use in calculating BGC grid"""
+    
+    grid = xr.open_dataset(datafile)
+    time = (
+        ( grid.time.values.astype('datetime64[ns]') - np.datetime64('1970-01-01T00:00:00', 'ns') 
+       ) / np.timedelta64(1,'ns') 
+    ) / 1e9 / 86400 # days ref. 1970-01-01
+    
+    mean_temp = grid.mean_temp
+    mean_salt = grid.mean_sal
+    
+    return grid.latitude.values, grid.longitude.values, time, mean_temp, mean_salt, grid
+
+def get_workerlist(client, n_workers) -> list:
+    """ Returns list of  n worker-addresses that the client submits tasks to.
+    None means all available workers work on the job.
+    Ref: https://dask.discourse.group/t/how-can-i-let-only-a-few-workers-start-a-small-task-while-others-wait-on-a-remote-cluster/2202 """
+    
+    if n_workers == None: return None
+    from distributed import get_worker
+    a = client.run(lambda: get_worker().address)
+    if n_workers < 1 or n_workers > len(a): raise IndexError("Out of range")
+    return list(a)[:n_workers]
+
+def get_from_batches( from_compute, batchsize) -> np.ndarray:
+    """ 
+    Unpacks results after doing computation in batches. When time: try using dask.bag-API 
+    """
+    except_last = np.array(from_compute[:-1])
+    shape = except_last.shape
+    new_shape = [shape[0]*batchsize]
+    for dim in range(2, len(shape)):
+        new_shape.append(shape[dim])
+    except_last_reshaped = except_last.reshape(tuple(new_shape))
+    last = np.array(from_compute[-1])
+    return np.concatenate( (except_last_reshaped, last), axis = 0 )
